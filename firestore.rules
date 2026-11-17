@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function myUser() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isAdmin() { return signedIn() && myUser().role == 'admin'; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function isActiveUser() { return signedIn() && myUser().role == 'user' && myUser().suspended != true; }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (isSelf(uid) || isAdmin() || isActiveUser());
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (isSelf(uid)
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.suspended == resource.data.suspended
+        && request.resource.data.username == resource.data.username
+        && request.resource.data.display_name == resource.data.display_name);
+    }
+
+    match /connections/{connectionId} {
+      // Keep these as separate, field-per-query predicates: a list query must be
+      // provably allowed by the rule, and `uid in [resource.data.a, resource.data.b]`
+      // cannot be proven for a `where(field, '==', uid)` query ("rules are not filters").
+      allow read: if signedIn() && request.auth.uid == resource.data.user_one_id;
+      allow read: if signedIn() && request.auth.uid == resource.data.user_two_id;
+      allow read: if isAdmin();
+      allow create, delete: if isAdmin();
+      allow update: if false;
+    }
+
+    match /messages/{messageId} {
+      function connOnCreate() { return get(/databases/$(database)/documents/connections/$(request.resource.data.connection_id)).data; }
+      function connOnExisting() { return get(/databases/$(database)/documents/connections/$(resource.data.connection_id)).data; }
+      // Participants may update receipts, delete a message for themselves
+      // (`deleted_for`) or for both (`deleted`), and the sender may edit text.
+      // Nothing is destroyed by allow update: documents, text and Cloudinary
+      // media all stay, and allow delete remains admin-only.
+      function receiptOnly() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['is_read', 'delivered_to', 'seen_at'])
+          && request.resource.data.content == resource.data.content;
+      }
+      // "Delete for me": append only the caller's own uid to deleted_for.
+      function hideForMe() {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deleted_for'])
+          && request.resource.data.content == resource.data.content
+          && request.resource.data.get('deleted_for', []).removeAll(resource.data.get('deleted_for', [])).hasOnly([request.auth.uid]);
+      }
+      // "Delete for everyone": one-way flag that hides the message for both sides.
+      function hideOnce() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['deleted', 'deleted_by', 'deleted_at'])
+          && request.resource.data.deleted == true
+          && request.resource.data.deleted_by == request.auth.uid
+          && resource.data.get('deleted', false) == false
+          && request.resource.data.content == resource.data.content;
+      }
+      // Only the sender may rewrite a text message; media content is immutable.
+      function editText() {
+        return request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['content', 'edited_at'])
+          && resource.data.type == 'text'
+          && request.resource.data.type == 'text'
+          && request.resource.data.sender_id == request.auth.uid
+          && resource.data.get('deleted', false) == false
+          && request.resource.data.content is string
+          && request.resource.data.content.size() > 0
+          && request.resource.data.content.size() <= 4000;
+      }
+      allow read: if signedIn() && (isAdmin() || request.auth.uid in [connOnExisting().user_one_id, connOnExisting().user_two_id]);
+      allow create: if isActiveUser()
+        && request.resource.data.sender_id == request.auth.uid
+        && request.resource.data.connection_id is string
+        && request.auth.uid in [connOnCreate().user_one_id, connOnCreate().user_two_id]
+        && request.resource.data.type in ['text', 'image', 'audio']
+        && request.resource.data.content is string
+        && request.resource.data.content.size() > 0;
+      allow update: if signedIn()
+        && request.auth.uid in [connOnExisting().user_one_id, connOnExisting().user_two_id]
+        && request.resource.data.sender_id == resource.data.sender_id
+        && request.resource.data.connection_id == resource.data.connection_id
+        && request.resource.data.type == resource.data.type
+        && (receiptOnly() || hideForMe() || hideOnce() || editText());
+      allow delete: if isAdmin();
+    }
+
+    match /typing/{typingId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.resource.data.user_id == request.auth.uid;
+      allow delete: if signedIn() && resource.data.user_id == request.auth.uid;
+    }
+  }
+}
