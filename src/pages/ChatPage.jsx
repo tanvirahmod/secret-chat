@@ -1,21 +1,35 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  addDoc, arrayUnion, collection, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc, updateDoc, where, writeBatch, getDocs,
+  addDoc, arrayUnion, collection, deleteField, doc, limit, onSnapshot, orderBy, query, serverTimestamp, setDoc, updateDoc, where, writeBatch, getDocs,
 } from 'firebase/firestore'
 import EmojiPicker from 'emoji-picker-react'
 import imageCompression from 'browser-image-compression'
 import { v4 as uuidv4 } from 'uuid'
 import {
-  Check, CheckCheck, ImagePlus, Menu, Mic, Pause, Pencil, Play, Send, Smile, Square, Trash2, X,
+  Check, CheckCheck, Copy, Eraser, Eye, EyeOff, ImagePlus, Menu, Mic, MoreHorizontal, Pause, Pencil, Play, Reply, Send, Smile, SmilePlus, Square, Trash2, X,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { db } from '../lib/firebase'
 import { useAuth } from '../contexts/AuthContext'
-import { formatLastSeen, formatTime, isUserOnline } from '../utils/helpers'
+import { formatLastSeen, formatTime, isUserOnline, timestampToMs } from '../utils/helpers'
 
 const CLOUDINARY_CLOUD_NAME = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME
 const CLOUDINARY_UPLOAD_PRESET = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
+const SWIPE_REPLY_PX = 48
+const LONG_PRESS_MS = 450
+
+// Messages older than the cutoff are hidden from this user. While a chat is
+// hidden, the cutoff is the moment it was hidden, so new messages still show.
+// A hidden chat whose hidden_at is still pending hides everything for a beat
+// rather than flashing the old history.
+function cutoffFor(prefs) {
+  if (!prefs) return 0
+  const cleared = prefs.clearedAt || 0
+  if (!prefs.hidden) return cleared
+  return prefs.hiddenAt == null ? Number.MAX_SAFE_INTEGER : Math.max(cleared, prefs.hiddenAt)
+}
 
 // Unsigned direct-to-Cloudinary upload: Storage for Firebase requires the Blaze plan.
 // The preset enforces allowed_formats; size has to be enforced here (presets can't).
@@ -135,6 +149,15 @@ export default function ChatPage() {
   const [sendingAudio, setSendingAudio] = useState(false)
   const [editing, setEditing] = useState(null) // { id, value } while a text message is being edited
   const [deleteTarget, setDeleteTarget] = useState(null) // message awaiting delete-for-me / delete-for-everyone
+  const [menuFor, setMenuFor] = useState(null) // message opened by long-press / right-click
+  const [replyTo, setReplyTo] = useState(null) // { id, sender_id, type, content } staged reply
+  const [dragX, setDragX] = useState({ id: null, x: 0 }) // horizontal swipe offset for reply
+  const [selectMode, setSelectMode] = useState(false) // multi-select for bulk delete
+  const [selected, setSelected] = useState([]) // message ids picked in select mode
+  const [chatPrefs, setChatPrefs] = useState({}) // connectionId -> { hidden, clearedAt }
+  const [chatMenu, setChatMenu] = useState(null) // contact opened by long-press / ⋯ button
+  const [prefsLoaded, setPrefsLoaded] = useState(false) // hold the list until prefs land, so history never flashes
+  const [showReactionPicker, setShowReactionPicker] = useState(false) // full emoji picker inside the message sheet
   const [showEmoji, setShowEmoji] = useState(false)
   const [typingPeer, setTypingPeer] = useState(false)
   const [lightbox, setLightbox] = useState(null)
@@ -146,11 +169,18 @@ export default function ChatPage() {
   const fileInputRef = useRef(null)
   const pendingAudioUrlRef = useRef(null)
   const composerRef = useRef(null)
+  const pressTimer = useRef(null)
+  const contactPressTimer = useRef(null)
+  const gesture = useRef(null)
+  const defaultsApplied = useRef(new Set()) // connections already re-hidden for this sign-in
+  const suppressClick = useRef(false) // swallow the click that follows a long-press
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => () => {
     if (pendingAudioUrlRef.current) URL.revokeObjectURL(pendingAudioUrlRef.current)
   }, [])
+
+  useEffect(() => { if (!menuFor) setShowReactionPicker(false) }, [menuFor])
 
   // Grow the composer so the whole message is visible, scrolling past max-h-48 (192px).
   useEffect(() => {
@@ -208,6 +238,26 @@ export default function ChatPage() {
     return () => unsubs.forEach((u) => u())
   }, [profile?.id, connections])
 
+  // Per-user chat state (hidden / cleared) lives under the user's own document,
+  // so a hidden or cleared chat never affects the other participant.
+  useEffect(() => {
+    if (!profile?.id) return
+    const unsub = onSnapshot(collection(db, 'users', profile.id, 'chat_prefs'), (snap) => {
+      const next = {}
+      snap.docs.forEach((d) => {
+        const data = d.data()
+        next[d.id] = {
+          hidden: data.hidden === true,
+          clearedAt: data.cleared_at?.toMillis ? data.cleared_at.toMillis() : 0,
+          hiddenAt: data.hidden_at?.toMillis ? data.hidden_at.toMillis() : null,
+        }
+      })
+      setChatPrefs(next)
+      setPrefsLoaded(true)
+    }, (err) => console.error('chat prefs listener', err))
+    return () => unsub()
+  }, [profile?.id])
+
   const contacts = useMemo(() => {
     return connections.map((c) => {
       const peerId = c.user_one_id === profile.id ? c.user_two_id : c.user_one_id
@@ -216,22 +266,44 @@ export default function ChatPage() {
       .sort((a, b) => (a.peer.display_name || '').localeCompare(b.peer.display_name || ''))
   }, [connections, usersById, profile?.id, now])
 
+  // Every sign-in starts hidden: the old history sits behind "Show chat", while
+  // messages that arrive from now on are visible. Runs once per connection per
+  // session, so pressing "Show chat" is never undone by this effect.
+  useEffect(() => {
+    if (!profile?.id || contacts.length === 0) return
+    const pending = contacts.filter((c) => !defaultsApplied.current.has(c.connectionId))
+    if (pending.length === 0) return
+    pending.forEach((c) => defaultsApplied.current.add(c.connectionId))
+    const batch = writeBatch(db)
+    pending.forEach((c) => {
+      batch.set(doc(db, 'users', profile.id, 'chat_prefs', c.connectionId), {
+        connection_id: c.connectionId,
+        hidden: true,
+        hidden_at: serverTimestamp(),
+        updated_at: serverTimestamp(),
+      }, { merge: true })
+    })
+    batch.commit().catch((err) => console.error('chat defaults', err))
+  }, [profile?.id, contacts])
+
   useEffect(() => {
     if (!profile?.id || contacts.length === 0) { setUnread({}); return }
     const unsubs = contacts.map((c) => {
       const q = query(collection(db, 'messages'), where('connection_id', '==', c.connectionId), where('is_read', '==', false))
       return onSnapshot(q, (snap) => {
+          const cutoff = cutoffFor(chatPrefs[c.connectionId])
         const count = snap.docs.filter((d) => {
           const data = d.data()
           return data.sender_id !== profile.id
             && data.deleted !== true
             && !(data.deleted_for || []).includes(profile.id)
+            && (data.created_at ? timestampToMs(data.created_at) > cutoff : true)
         }).length
         setUnread((prev) => ({ ...prev, [c.connectionId]: count }))
       }, (err) => console.error('unread listener', c.connectionId, err))
     })
     return () => unsubs.forEach((u) => u())
-  }, [contacts.map((c) => c.connectionId).join('|'), profile?.id])
+  }, [contacts.map((c) => c.connectionId).join('|'), profile?.id, chatPrefs])
 
   useEffect(() => {
     if (!active?.connectionId) { setMessages([]); return }
@@ -239,10 +311,14 @@ export default function ChatPage() {
     const unsub = onSnapshot(q, async (snap) => {
       // Removed messages stay on the server: either hidden for one user
       // (`deleted_for`) or for both (`deleted`).
+      const cutoff = cutoffFor(chatPrefs[active.connectionId])
       const msgs = snap.docs
         .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((m) => m.deleted !== true && !(m.deleted_for || []).includes(profile.id))
+        .filter((m) => m.deleted !== true
+          && !(m.deleted_for || []).includes(profile.id)
+          && (m.created_at ? timestampToMs(m.created_at) > cutoff : true))
       setMessages(msgs)
+      // Only the messages actually on screen get marked as seen.
       const batch = writeBatch(db)
       let changed = false
       msgs.forEach((m) => {
@@ -254,7 +330,7 @@ export default function ChatPage() {
       if (changed) await batch.commit().catch(() => {})
     }, (err) => console.error('messages listener', active.connectionId, err))
     return () => unsub()
-  }, [active?.connectionId, profile?.id])
+  }, [active?.connectionId, profile?.id, chatPrefs])
 
   useEffect(() => {
     if (!active?.connectionId || !active?.peerId) { setTypingPeer(false); return }
@@ -272,7 +348,14 @@ export default function ChatPage() {
     return () => { unsub(); clearInterval(interval) }
   }, [active?.connectionId, active?.peerId])
 
-  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+  const activePrefs = active ? chatPrefs[active.connectionId] : null
+  const activeCutoff = useMemo(() => cutoffFor(activePrefs), [activePrefs])
+  const visibleMessages = useMemo(() => {
+    if (!prefsLoaded) return []
+    return messages.filter((m) => !m.created_at || timestampToMs(m.created_at) > activeCutoff)
+  }, [messages, activeCutoff, prefsLoaded])
+
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [visibleMessages])
 
   async function setTyping(isTyping) {
     if (!active?.connectionId || !profile?.id) return
@@ -299,6 +382,7 @@ export default function ChatPage() {
     setText('')
     setShowEmoji(false)
     setTyping(false)
+    const reply = replyTo ? { reply_to: replyTo } : {}
     try {
       await addDoc(collection(db, 'messages'), {
         connection_id: active.connectionId,
@@ -307,7 +391,9 @@ export default function ChatPage() {
         content,
         is_read: false,
         created_at: serverTimestamp(),
+        ...reply,
       })
+      if (replyTo) setReplyTo(null)
     } catch (err) { toast.error(err.message || 'Failed to send') }
   }
 
@@ -331,7 +417,9 @@ export default function ChatPage() {
         is_read: false,
         created_at: serverTimestamp(),
         file_name: file.name || '',
+        ...(replyTo ? { reply_to: replyTo } : {}),
       })
+      if (replyTo) setReplyTo(null)
       return true
     } catch (err) {
       console.error(err)
@@ -405,6 +493,26 @@ export default function ChatPage() {
     }
   }
 
+  // Bulk delete: one batched write per selected message. Each document is still
+  // validated on its own by the rules, and nothing is removed from the server.
+  async function bulkDelete(forEveryone) {
+    const ids = [...selected]
+    if (!ids.length) return
+    if (forEveryone && !window.confirm(`Delete ${ids.length} message${ids.length > 1 ? 's' : ''} for both of you?`)) return
+    const batch = writeBatch(db)
+    ids.forEach((id) => {
+      batch.update(doc(db, 'messages', id), forEveryone
+        ? { deleted: true, deleted_by: profile.id, deleted_at: serverTimestamp() }
+        : { deleted_for: arrayUnion(profile.id) })
+    })
+    try {
+      await batch.commit()
+      exitSelect()
+    } catch (err) {
+      toast.error(err.message || 'Could not delete the selected messages')
+    }
+  }
+
   function startEdit(m) {
     setEditing({ id: m.id, value: m.content })
   }
@@ -420,6 +528,138 @@ export default function ChatPage() {
     } catch (err) {
       toast.error(err.message || 'Could not edit message')
     }
+  }
+
+  function previewOf(msg) {
+    if (!msg) return ''
+    if (msg.type === 'image') return 'Photo'
+    if (msg.type === 'audio') return 'Voice note'
+    return msg.content || ''
+  }
+
+  function startReply(m) {
+    setMenuFor(null)
+    setReplyTo({ id: m.id, sender_id: m.sender_id, type: m.type, content: m.content })
+    requestAnimationFrame(() => composerRef.current?.focus())
+  }
+
+  async function react(m, emoji) {
+    setMenuFor(null)
+    const current = m[`reaction_${profile.id}`]
+    try {
+      // Own field only: rules reject any other key, so reactions can't be forged.
+      await updateDoc(doc(db, 'messages', m.id), {
+        [`reaction_${profile.id}`]: current === emoji ? deleteField() : emoji,
+      })
+    } catch (err) {
+      toast.error(err.message || 'Could not react')
+    }
+  }
+
+  function cancelPress() {
+    if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null }
+  }
+
+  function startPress(m) {
+    cancelPress()
+    pressTimer.current = setTimeout(() => {
+      pressTimer.current = null
+      suppressClick.current = true
+      setTimeout(() => { suppressClick.current = false }, 600)
+      navigator.vibrate?.(10)
+      setMenuFor(m)
+    }, LONG_PRESS_MS)
+  }
+
+  function resetGesture() {
+    cancelPress()
+    gesture.current = null
+    setDragX({ id: null, x: 0 })
+  }
+
+  // Swipe a bubble to the right to reply; holding it opens the action sheet.
+  function onBubbleTouchStart(m, e) {
+    if (e.touches.length !== 1 || e.target.closest('button')) return
+    if (selectMode) return // in select mode a tap toggles instead of dragging
+    gesture.current = { id: m.id, message: m, startX: e.touches[0].clientX, startY: e.touches[0].clientY, dx: 0, swiping: false }
+    setDragX({ id: null, x: 0 })
+    startPress(m)
+  }
+
+  function onBubbleTouchMove(e) {
+    const g = gesture.current
+    if (!g || e.touches.length !== 1) return
+    const dx = e.touches[0].clientX - g.startX
+    const dy = e.touches[0].clientY - g.startY
+    if (!g.swiping) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return
+      // Vertical movement (scrolling) or a leftward swipe abandons the gesture.
+      if (dx <= 0 || Math.abs(dy) >= Math.abs(dx)) { resetGesture(); return }
+      g.swiping = true
+      cancelPress()
+    }
+    g.dx = Math.min(dx, 72)
+    setDragX({ id: g.id, x: g.dx })
+  }
+
+  function onBubbleTouchEnd() {
+    const g = gesture.current
+    if (g?.swiping && g.dx >= SWIPE_REPLY_PX) startReply(g.message)
+    resetGesture()
+  }
+
+  function cancelContactPress() {
+    if (contactPressTimer.current) { clearTimeout(contactPressTimer.current); contactPressTimer.current = null }
+  }
+
+  function startContactPress(c) {
+    cancelContactPress()
+    contactPressTimer.current = setTimeout(() => {
+      contactPressTimer.current = null
+      navigator.vibrate?.(10)
+      setChatMenu(c)
+    }, LONG_PRESS_MS)
+  }
+
+  async function setChatHidden(c, hidden) {
+    setChatMenu(null)
+    try {
+      await setDoc(doc(db, 'users', profile.id, 'chat_prefs', c.connectionId), {
+        connection_id: c.connectionId,
+        hidden,
+        // Hiding starts the cutoff at now; showing drops it back to the cleared mark.
+        hidden_at: hidden ? serverTimestamp() : null,
+        updated_at: serverTimestamp(),
+      }, { merge: true })
+    } catch (err) {
+      toast.error(err.message || 'Could not update this chat')
+    }
+  }
+
+  async function clearChat(c) {
+    setChatMenu(null)
+    if (!window.confirm('Clear this chat? The messages are hidden for you only and stay on the server.')) return
+    try {
+      // Cleared = a timestamp: everything older is hidden for this user, newer
+      // messages keep arriving, and nothing is deleted from Firestore.
+      await setDoc(doc(db, 'users', profile.id, 'chat_prefs', c.connectionId), {
+        connection_id: c.connectionId,
+        cleared_at: serverTimestamp(),
+        hidden: false,
+        updated_at: serverTimestamp(),
+      }, { merge: true })
+    } catch (err) {
+      toast.error(err.message || 'Could not clear this chat')
+    }
+  }
+
+  function toggleSelect(id) {
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+
+  function exitSelect() {
+    setSelectMode(false)
+    setSelected([])
   }
 
   function renderReceipt(m) {
@@ -444,22 +684,40 @@ export default function ChatPage() {
         </div>
         <div className="flex-1 overflow-y-auto">
           {contacts.length === 0 && <p className="p-4 text-sm text-slate-500">No approved contacts yet. Ask the Controller to connect you.</p>}
-          {contacts.map((c) => (
-            <button key={c.connectionId} onClick={() => { setActive(c); setSidebarOpen(false) }}
-              className={`w-full text-left px-4 py-3 border-b border-slate-800/60 hover:bg-slate-800/60 flex items-center gap-3 ${active?.connectionId === c.connectionId ? 'bg-slate-800' : ''}`}>
-              <div className="relative">
-                <div className="h-10 w-10 rounded-full bg-indigo-700 flex items-center justify-center font-semibold">{(c.peer.display_name || '?')[0].toUpperCase()}</div>
-                <span className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-slate-900 ${c.online ? 'bg-emerald-400' : 'bg-slate-500'}`} />
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium truncate">{c.peer.display_name}</span>
-                  {unread[c.connectionId] > 0 && <span className="text-xs bg-indigo-600 text-white rounded-full px-2 py-0.5">{unread[c.connectionId]}</span>}
+          {contacts.map((c) => {
+            const prefs = chatPrefs[c.connectionId] || {}
+            return (
+              <div key={c.connectionId}
+                role="button" tabIndex={0}
+                onClick={() => { setActive(c); setSidebarOpen(false); exitSelect() }}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setActive(c); setSidebarOpen(false); exitSelect() } }}
+                onTouchStart={() => startContactPress(c)}
+                onTouchEnd={cancelContactPress}
+                onTouchMove={cancelContactPress}
+                onTouchCancel={cancelContactPress}
+                onContextMenu={(e) => { e.preventDefault(); setChatMenu(c) }}
+                className={`group w-full text-left px-4 py-3 border-b border-slate-800/60 hover:bg-slate-800/60 flex items-center gap-3 cursor-pointer ${active?.connectionId === c.connectionId ? 'bg-slate-800' : ''}`}>
+                <div className="relative">
+                  <div className="h-10 w-10 rounded-full bg-indigo-700 flex items-center justify-center font-semibold">{(c.peer.display_name || '?')[0].toUpperCase()}</div>
+                  <span className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-slate-900 ${c.online ? 'bg-emerald-400' : 'bg-slate-500'}`} />
                 </div>
-                <div className="text-xs text-slate-400 truncate">{c.online ? 'Online' : formatLastSeen(c.peer, now)}</div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={`font-medium truncate ${prefs.hidden ? 'text-slate-400' : ''}`}>{c.peer.display_name}</span>
+                    {unread[c.connectionId] > 0 && <span className="text-xs bg-indigo-600 text-white rounded-full px-2 py-0.5">{unread[c.connectionId]}</span>}
+                  </div>
+                  <div className="text-xs text-slate-400 truncate">
+                    {prefs.hidden
+                      ? <span className="inline-flex items-center gap-1"><EyeOff size={12} />Chat hidden</span>
+                      : (c.online ? 'Online' : formatLastSeen(c.peer, now))}
+                  </div>
+                </div>
+                <button type="button" onClick={(e) => { e.stopPropagation(); setChatMenu(c) }}
+                  className="shrink-0 p-1.5 rounded-lg text-slate-400 hover:bg-slate-700 hover:text-white sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+                  title="Chat options"><MoreHorizontal size={16} /></button>
               </div>
-            </button>
-          ))}
+            )
+          })}
         </div>
       </aside>
 
@@ -482,12 +740,58 @@ export default function ChatPage() {
               </div>
             </header>
 
+            {selectMode && (
+              <div className="flex items-center gap-2 border-b border-slate-800 bg-slate-900 px-3 py-2">
+                <button type="button" onClick={exitSelect} className="p-1.5 rounded hover:bg-slate-800" title="Cancel selection"><X size={18} /></button>
+                <div className="text-sm font-medium">{selected.length} selected</div>
+                <div className="ml-auto flex items-center gap-2">
+                  <button type="button" onClick={() => bulkDelete(false)} disabled={!selected.length} className="rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-50 px-2.5 py-1.5 text-xs">Delete for me</button>
+                  <button type="button" onClick={() => bulkDelete(true)} disabled={!selected.length} className="rounded-lg bg-red-600 hover:bg-red-500 disabled:opacity-50 px-2.5 py-1.5 text-xs">Delete for everyone</button>
+                </div>
+              </div>
+            )}
+
+            {activePrefs?.hidden && (
+              <div className="flex items-center gap-2 border-b border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-400">
+                <EyeOff size={14} />
+                <span className="truncate">Earlier messages are hidden. New messages still appear.</span>
+                <button type="button" onClick={() => setChatHidden(active, false)} className="ml-auto shrink-0 rounded-lg bg-slate-800 hover:bg-slate-700 px-2.5 py-1.5 text-xs text-white">Show chat</button>
+              </div>
+            )}
             <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-950">
-              {messages.map((m) => {
+              {visibleMessages.map((m) => {
                 const mine = m.sender_id === profile.id
+                const myReaction = m[`reaction_${profile.id}`]
+                const peerReaction = active?.peerId ? m[`reaction_${active.peerId}`] : null
+                const dragging = dragX.id === m.id
                 return (
                   <div key={m.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`group max-w-[85%] sm:max-w-[70%] rounded-2xl px-3 py-2 ${mine ? 'bg-indigo-600 text-white rounded-br-md' : 'bg-slate-800 text-slate-100 rounded-bl-md'}`}>
+                    <div className="group relative max-w-[85%] sm:max-w-[70%]">
+                      <div className={`absolute -top-4 z-10 hidden sm:flex items-center gap-0.5 rounded-full border border-slate-700 bg-slate-900/95 px-1 py-0.5 shadow opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 ${mine ? 'right-0' : 'left-0'}`}>
+                        <button type="button" onClick={() => setMenuFor(m)} className="p-1.5 rounded-full text-slate-300 hover:bg-slate-800 hover:text-white" title="React"><Smile size={14} /></button>
+                        <button type="button" onClick={() => startReply(m)} className="p-1.5 rounded-full text-slate-300 hover:bg-slate-800 hover:text-white" title="Reply"><Reply size={14} /></button>
+                        <button type="button" onClick={() => setMenuFor(m)} className="p-1.5 rounded-full text-slate-300 hover:bg-slate-800 hover:text-white" title="More"><MoreHorizontal size={14} /></button>
+                      </div>
+                      {dragging && dragX.x > 6 && (
+                        <div className="absolute -left-4 top-1/2 -translate-y-1/2 text-slate-400" style={{ opacity: Math.min(dragX.x / SWIPE_REPLY_PX, 1) }}><Reply size={18} /></div>
+                      )}
+                      <div className="flex flex-col min-w-0">
+                      <div
+                        onTouchStart={(e) => onBubbleTouchStart(m, e)}
+                        onTouchMove={onBubbleTouchMove}
+                        onTouchEnd={onBubbleTouchEnd}
+                        onTouchCancel={resetGesture}
+                        onContextMenu={(e) => { e.preventDefault(); if (selectMode) { toggleSelect(m.id); return } setMenuFor(m) }}
+                        onClick={(e) => { if (!selectMode || e.target.closest('button')) return; toggleSelect(m.id) }}
+                        style={{ transform: dragging ? `translateX(${dragX.x}px)` : undefined }}
+                        className={`rounded-2xl px-3 py-2 ${selected.includes(m.id) ? 'ring-2 ring-sky-400' : ''} ${dragging ? '' : 'transition-transform duration-150'} ${mine ? 'bg-indigo-600 text-white rounded-br-md' : 'bg-slate-800 text-slate-100 rounded-bl-md'}`}
+                      >
+                      {m.reply_to && (
+                        <div className="mb-1 rounded-md border-l-2 border-white/50 bg-black/20 px-2 py-1">
+                          <div className={`text-[11px] font-medium ${mine ? 'text-indigo-100' : 'text-indigo-300'}`}>{m.reply_to.sender_id === profile.id ? 'You' : (activePeer?.display_name || 'Them')}</div>
+                          <div className="truncate text-xs opacity-80">{previewOf(m.reply_to)}</div>
+                        </div>
+                      )}
                       {m.type === 'text' && (editing?.id === m.id ? (
                         <div className="min-w-[180px]">
                           <textarea
@@ -510,16 +814,20 @@ export default function ChatPage() {
                         <p className="whitespace-pre-wrap break-words">{m.content}</p>
                       ))}
                       {m.type === 'image' && (
-                        <img src={m.content} alt="attachment" className="max-h-72 rounded-lg cursor-pointer object-cover" onClick={() => setLightbox(m.content)} />
+                        <img src={m.content} alt="attachment" className="max-h-72 rounded-lg cursor-pointer object-cover" onClick={(e) => { if (selectMode) { e.stopPropagation(); toggleSelect(m.id); return } if (suppressClick.current) return; setLightbox(m.content) }} />
                       )}
                       {m.type === 'audio' && <AudioBubble url={m.content} />}
                       <div className={`flex items-center gap-1 mt-1 text-[11px] ${mine ? 'text-indigo-100 justify-end' : 'text-slate-400'}`}>
                         <span>{formatTime(m.created_at)}{m.edited_at ? ' · edited' : ''}</span>
                         {renderReceipt(m)}
-                        {m.type === 'text' && mine && (
-                          <button type="button" onClick={() => startEdit(m)} className="ml-1 opacity-40 hover:opacity-100 transition-opacity" title="Edit message"><Pencil size={12} /></button>
-                        )}
-                        <button type="button" onClick={() => setDeleteTarget(m)} className="ml-1 opacity-40 hover:opacity-100 hover:text-red-400 transition-opacity" title="Delete message"><Trash2 size={12} /></button>
+                      </div>
+                      </div>
+                      {(myReaction || peerReaction) && (
+                        <div className={`mt-1 flex gap-1 ${mine ? 'justify-end' : 'justify-start'}`}>
+                          {myReaction && <span className="rounded-full bg-slate-800/90 px-1.5 py-0.5 text-[11px] ring-1 ring-slate-700" title="You">{myReaction}</span>}
+                          {peerReaction && <span className="rounded-full bg-slate-800/90 px-1.5 py-0.5 text-[11px] ring-1 ring-slate-700" title={activePeer?.display_name || 'Them'}>{peerReaction}</span>}
+                        </div>
+                      )}
                       </div>
                     </div>
                   </div>
@@ -543,6 +851,15 @@ export default function ChatPage() {
                   <button type="button" onClick={sendPendingAudio} disabled={sendingAudio} className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-3 py-2 text-sm text-white">
                     <Send size={16} />{sendingAudio ? 'Sending...' : 'Send'}
                   </button>
+                </div>
+              )}
+              {replyTo && (
+                <div className="mb-2 flex items-center gap-2 rounded-lg border-l-2 border-indigo-500 bg-slate-950 px-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] font-medium text-indigo-400">Replying to {replyTo.sender_id === profile.id ? 'yourself' : (activePeer?.display_name || 'them')}</div>
+                    <div className="truncate text-xs text-slate-400">{previewOf(replyTo)}</div>
+                  </div>
+                  <button type="button" onClick={() => setReplyTo(null)} className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-white" title="Cancel reply"><X size={14} /></button>
                 </div>
               )}
               <form onSubmit={sendText} className="flex items-end gap-2 relative">
@@ -570,6 +887,56 @@ export default function ChatPage() {
           </>
         )}
       </section>
+
+      {chatMenu && (
+        <div className="fixed inset-0 z-40 flex items-end sm:items-center justify-center bg-black/60 p-4" onClick={() => setChatMenu(null)}>
+          <div className="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 p-3" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-2 truncate px-1 text-sm font-medium">{chatMenu.peer?.display_name}</div>
+            <button type="button" onClick={() => clearChat(chatMenu)} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800"><Eraser size={16} />Clear chat</button>
+            <button type="button" onClick={() => setChatHidden(chatMenu, !chatPrefs[chatMenu.connectionId]?.hidden)} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800">
+              {chatPrefs[chatMenu.connectionId]?.hidden ? <><Eye size={16} />Show chat</> : <><EyeOff size={16} />Hide chat</>}
+            </button>
+            <button type="button" onClick={() => setChatMenu(null)} className="mt-1 w-full rounded-lg py-2 text-sm text-slate-400 hover:text-white">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {menuFor && (
+        <div className="fixed inset-0 z-40 flex items-end sm:items-center justify-center bg-black/60 p-4" onClick={() => setMenuFor(null)}>
+          <div className="w-full max-w-sm max-h-[85vh] overflow-y-auto rounded-2xl border border-slate-700 bg-slate-900 p-3" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-2 truncate px-1 text-xs text-slate-400">{previewOf(menuFor)}</div>
+            <div className="mb-2 flex items-center justify-between gap-1 rounded-full bg-slate-800 px-2 py-1.5">
+              {QUICK_REACTIONS.map((emoji) => (
+                <button key={emoji} type="button" onClick={() => react(menuFor, emoji)}
+                  className={`h-9 w-9 rounded-full text-xl leading-none hover:bg-slate-700 ${menuFor[`reaction_${profile.id}`] === emoji ? 'bg-slate-700 ring-1 ring-indigo-400' : ''}`}>{emoji}</button>
+              ))}
+              <button type="button" onClick={() => setShowReactionPicker((v) => !v)}
+                className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full hover:bg-slate-700 ${showReactionPicker ? 'bg-slate-700 text-white' : 'text-slate-300'}`}
+                title="Any emoji"><SmilePlus size={18} /></button>
+            </div>
+            {showReactionPicker && (
+              <div className="mb-2 max-h-[45vh] overflow-y-auto rounded-lg">
+                <EmojiPicker onEmojiClick={(e) => react(menuFor, e.emoji)} theme="dark" width="100%" height={320} />
+              </div>
+            )}
+            <button type="button" onClick={() => startReply(menuFor)} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800"><Reply size={16} />Reply</button>
+            {menuFor.type === 'text' && (
+              <button type="button" onClick={async () => {
+                const m = menuFor
+                setMenuFor(null)
+                try { await navigator.clipboard.writeText(m.content); toast.success('Message copied') }
+                catch { toast.error('Could not copy') }
+              }} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800"><Copy size={16} />Copy text</button>
+            )}
+            <button type="button" onClick={() => { const m = menuFor; setMenuFor(null); setSelectMode(true); setSelected([m.id]) }} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800"><Check size={16} />Select</button>
+            {menuFor.type === 'text' && menuFor.sender_id === profile.id && (
+              <button type="button" onClick={() => { const m = menuFor; setMenuFor(null); startEdit(m) }} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm hover:bg-slate-800"><Pencil size={16} />Edit</button>
+            )}
+            <button type="button" onClick={() => { const m = menuFor; setMenuFor(null); setDeleteTarget(m) }} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-red-400 hover:bg-slate-800"><Trash2 size={16} />Delete</button>
+            <button type="button" onClick={() => setMenuFor(null)} className="mt-1 w-full rounded-lg py-2 text-sm text-slate-400 hover:text-white">Cancel</button>
+          </div>
+        </div>
+      )}
 
       {deleteTarget && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4" onClick={() => setDeleteTarget(null)}>

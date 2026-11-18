@@ -8,6 +8,12 @@ service cloud.firestore {
     function isActiveUser() { return signedIn() && myUser().role == 'user' && myUser().suspended != true; }
 
     match /users/{uid} {
+      // Per-user chat state (hidden / cleared_at). Only the owner can read or
+      // write it, so hiding or clearing a chat never touches the other person.
+      match /chat_prefs/{connectionId} {
+        allow read, write: if isSelf(uid) || isAdmin();
+      }
+
       allow read: if signedIn() && (isSelf(uid) || isAdmin() || isActiveUser());
       allow create, delete: if isAdmin();
       allow update: if isAdmin() || (isSelf(uid)
@@ -55,6 +61,15 @@ service cloud.firestore {
           && resource.data.get('deleted', false) == false
           && request.resource.data.content == resource.data.content;
       }
+      // Each participant owns exactly one reaction field, `reaction_<uid>`,
+      // so a reaction can't be written on someone else's behalf.
+      function reactionOnly() {
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reaction_' + request.auth.uid])
+          && request.resource.data.content == resource.data.content
+          && request.resource.data.get('reaction_' + request.auth.uid, '') is string
+          // One emoji, but family/flag emoji are long ZWJ byte sequences.
+          && request.resource.data.get('reaction_' + request.auth.uid, '').size() <= 40;
+      }
       // Only the sender may rewrite a text message; media content is immutable.
       function editText() {
         return request.resource.data.diff(resource.data).affectedKeys()
@@ -80,7 +95,7 @@ service cloud.firestore {
         && request.resource.data.sender_id == resource.data.sender_id
         && request.resource.data.connection_id == resource.data.connection_id
         && request.resource.data.type == resource.data.type
-        && (receiptOnly() || hideForMe() || hideOnce() || editText());
+        && (receiptOnly() || hideForMe() || hideOnce() || editText() || reactionOnly());
       allow delete: if isAdmin();
     }
 
