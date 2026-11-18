@@ -6,7 +6,7 @@ import EmojiPicker from 'emoji-picker-react'
 import imageCompression from 'browser-image-compression'
 import { v4 as uuidv4 } from 'uuid'
 import {
-  Check, CheckCheck, Copy, Eraser, Eye, EyeOff, ImagePlus, Menu, Mic, MoreHorizontal, Pause, Pencil, Play, Reply, Send, Smile, SmilePlus, Square, Trash2, X,
+  Bell, Check, CheckCheck, Copy, Eraser, Eye, EyeOff, ImagePlus, Menu, Mic, MoreHorizontal, Pause, Pencil, Play, Reply, Send, Smile, SmilePlus, Square, Trash2, X,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { db } from '../lib/firebase'
@@ -158,6 +158,8 @@ export default function ChatPage() {
   const [chatMenu, setChatMenu] = useState(null) // contact opened by long-press / ⋯ button
   const [prefsLoaded, setPrefsLoaded] = useState(false) // hold the list until prefs land, so history never flashes
   const [showReactionPicker, setShowReactionPicker] = useState(false) // full emoji picker inside the message sheet
+  const [notifPermission, setNotifPermission] = useState(() => (typeof window !== 'undefined' && 'Notification' in window ? Notification.permission : 'unsupported'))
+  const [notificationsOn, setNotificationsOn] = useState(true)
   const [showEmoji, setShowEmoji] = useState(false)
   const [typingPeer, setTypingPeer] = useState(false)
   const [lightbox, setLightbox] = useState(null)
@@ -173,6 +175,13 @@ export default function ChatPage() {
   const contactPressTimer = useRef(null)
   const gesture = useRef(null)
   const defaultsApplied = useRef(new Set()) // connections already re-hidden for this sign-in
+  const notifiedIds = useRef(new Set()) // message ids already considered for a notification
+  const primedConnections = useRef(new Set()) // first snapshot per chat is history, not news
+  const activeRef = useRef(null)
+  const openNotifications = useRef([])
+  const swRegistration = useRef(null) // notification-capable service worker (Android needs one)
+  const notificationsOnRef = useRef(true)
+  const prefTouched = useRef(false) // don't let a late profile load undo the user's toggle
   const suppressClick = useRef(false) // swallow the click that follows a long-press
   const [now, setNow] = useState(() => Date.now())
 
@@ -181,6 +190,74 @@ export default function ChatPage() {
   }, [])
 
   useEffect(() => { if (!menuFor) setShowReactionPicker(false) }, [menuFor])
+
+  useEffect(() => { activeRef.current = active }, [active])
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+    navigator.serviceWorker.register('/sw.js')
+      .then((reg) => { swRegistration.current = reg })
+      .catch((err) => console.error('service worker', err))
+  }, [])
+
+  useEffect(() => { notificationsOnRef.current = notificationsOn }, [notificationsOn])
+
+  // Restore the saved switch the first time the profile arrives.
+  useEffect(() => {
+    if (prefTouched.current || !profile) return
+    setNotificationsOn(profile.notifications !== false)
+  }, [profile])
+
+  async function toggleNotifications() {
+    const next = !notificationsOn
+    prefTouched.current = true
+    if (next) {
+      if (typeof Notification === 'undefined') {
+        toast.error('This browser does not support notifications.')
+        return
+      }
+      if (Notification.permission === 'denied') {
+        toast.error('Notifications are blocked for this site in your browser settings.')
+        return
+      }
+      if (Notification.permission !== 'granted') {
+        const permission = await Notification.requestPermission()
+        setNotifPermission(permission)
+        if (permission !== 'granted') { toast.error('Notifications blocked.'); return }
+      }
+    }
+    setNotificationsOn(next)
+    try {
+      await updateDoc(doc(db, 'users', profile.id), { notifications: next })
+    } catch (err) {
+      toast.error(err.message || 'Could not save the notification setting')
+    }
+  }
+
+  // Browser notification for a message that arrives while it can't be seen:
+  // either the tab is in the background or another chat is open.
+  function notifyNewMessage(c) {
+    if (!notificationsOnRef.current) return
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+    if (document.visibilityState === 'visible' && activeRef.current?.connectionId === c.connectionId) return
+    // Deliberately generic: no sender name and no message text on screen.
+    const options = { tag: `chat-${c.connectionId}`, renotify: true, silent: false }
+    if (swRegistration.current) {
+      // Android Chrome rejects the page-level constructor; this path also works
+      // on desktop, and the worker focuses the app when the notification is clicked.
+      swRegistration.current.showNotification('You Got New Text', options)
+        .catch((err) => console.error('notification', err))
+      return
+    }
+    try {
+      const n = new Notification('You Got New Text', options)
+      n.onclick = () => { window.focus(); setActive(c); n.close() }
+      openNotifications.current.push(n)
+      if (openNotifications.current.length > 20) openNotifications.current.shift()
+    } catch (err) {
+      console.error('notification', err)
+    }
+  }
 
   // Grow the composer so the whole message is visible, scrolling past max-h-48 (192px).
   useEffect(() => {
@@ -290,15 +367,24 @@ export default function ChatPage() {
     if (!profile?.id || contacts.length === 0) { setUnread({}); return }
     const unsubs = contacts.map((c) => {
       const q = query(collection(db, 'messages'), where('connection_id', '==', c.connectionId), where('is_read', '==', false))
-      return onSnapshot(q, (snap) => {
-          const cutoff = cutoffFor(chatPrefs[c.connectionId])
-        const count = snap.docs.filter((d) => {
+            return onSnapshot(q, (snap) => {
+        const cutoff = cutoffFor(chatPrefs[c.connectionId])
+        const primed = primedConnections.current.has(c.connectionId)
+        primedConnections.current.add(c.connectionId)
+        let count = 0
+        snap.docs.forEach((d) => {
           const data = d.data()
-          return data.sender_id !== profile.id
+          const visible = data.sender_id !== profile.id
             && data.deleted !== true
             && !(data.deleted_for || []).includes(profile.id)
             && (data.created_at ? timestampToMs(data.created_at) > cutoff : true)
-        }).length
+          if (visible) count += 1
+          // The first snapshot is existing history; later ones carry new mail.
+          if (!notifiedIds.current.has(d.id)) {
+            notifiedIds.current.add(d.id)
+            if (primed && visible) notifyNewMessage(c)
+          }
+        })
         setUnread((prev) => ({ ...prev, [c.connectionId]: count }))
       }, (err) => console.error('unread listener', c.connectionId, err))
     })
@@ -718,6 +804,20 @@ export default function ChatPage() {
               </div>
             )
           })}
+        </div>
+        <div className="border-t border-slate-800 px-4 py-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-sm text-slate-200"><Bell size={14} />Notifications</div>
+            <div className="truncate text-[11px] text-slate-500">
+              {notifPermission === 'denied'
+                ? 'Blocked in browser settings'
+                : notificationsOn ? 'New message alerts on' : 'Alerts off'}
+            </div>
+          </div>
+          <button type="button" role="switch" aria-checked={notificationsOn} onClick={toggleNotifications}
+            className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${notificationsOn ? 'bg-indigo-600' : 'bg-slate-700'}`}>
+            <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${notificationsOn ? 'left-[22px]' : 'left-0.5'}`} />
+          </button>
         </div>
       </aside>
 
